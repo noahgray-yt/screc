@@ -1,0 +1,183 @@
+# Screc – XcodeGen project description. Generate the Xcode project with:  xcodegen generate
+name: Screc
+options:
+  bundleIdPrefix: local.screc
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    # Ad-hoc signing ("Sign to Run Locally"): no Apple developer account needed.
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: NO
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+    GENERATE_INFOPLIST_FILE: YES
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "1.0"
+
+targets:
+  ScrecCore:
+    type: framework
+    platform: macOS
+    sources: [ScrecCore]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.screc.ScrecCore
+
+  ScrecCapture:
+    type: framework
+    platform: macOS
+    sources: [ScrecCapture]
+    dependencies:
+      - target: ScrecCore
+      - sdk: ScreenCaptureKit.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreMedia.framework
+      - sdk: IOKit.framework
+      - sdk: ApplicationServices.framework
+      - sdk: Carbon.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.screc.ScrecCapture
+
+  ScrecRender:
+    type: framework
+    platform: macOS
+    sources:
+      - path: ScrecRender
+        excludes: ["Shaders/*.msl"]
+      # Metal shader source (.msl), shipped as a resource and compiled by Metal at runtime: Xcode 27 needs a
+      # separate Metal Toolchain download to compile .metal files at build time, and Screc avoids extra
+      # installs (DEPENDENCIES.md).
+      - path: ScrecRender/Shaders/Compositor.msl
+        buildPhase: resources
+    dependencies:
+      - target: ScrecCore
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: MetalPerformanceShaders.framework
+      - sdk: CoreVideo.framework
+      - sdk: AVFoundation.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.screc.ScrecRender
+        MTL_FAST_MATH: NO
+
+  ScrecExport:
+    type: framework
+    platform: macOS
+    sources: [ScrecExport]
+    dependencies:
+      - target: ScrecCore
+      - target: ScrecRender
+      - sdk: AVFoundation.framework
+      - sdk: Metal.framework
+      - sdk: ImageIO.framework
+      - sdk: VideoToolbox.framework
+      - sdk: Speech.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.screc.ScrecExport
+
+  Screc:
+    type: application
+    platform: macOS
+    sources: [Screc]
+    dependencies:
+      - target: ScrecCore
+      - target: ScrecCapture
+      - target: ScrecRender
+      - target: ScrecExport
+      - sdk: Carbon.framework
+      - sdk: MetalKit.framework
+      - sdk: AVKit.framework
+    info:
+      path: Screc/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: Screc
+        LSApplicationCategoryType: public.app-category.video
+        NSMicrophoneUsageDescription: Screc records your microphone together with the screen when you switch it on.
+        NSCameraUsageDescription: Screc records your webcam as a separate track when you switch it on.
+        NSSpeechRecognitionUsageDescription: Screc turns your voice into captions on this Mac. The audio never leaves your Mac.
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Screc Project
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Owner
+            LSTypeIsPackage: true
+            LSItemContentTypes: [local.screc.project]
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: local.screc.project
+            UTTypeDescription: Screc Project
+            UTTypeConformsTo: [com.apple.package, public.composite-content]
+            UTTypeTagSpecification:
+              public.filename-extension: [screc]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.screc.Screc
+        PRODUCT_NAME: Screc
+        # Screc/Resources/AppIcon.icon (Icon Composer); actool also writes the fallback .icns for macOS 15.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Screc/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Screc/Resources/Screc.entitlements
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+
+  screc-check:
+    type: tool
+    platform: macOS
+    sources: [Tools/screc-check]
+    dependencies:
+      - target: ScrecCore
+        embed: false
+      - target: ScrecRender
+        embed: false
+      - target: ScrecExport
+        embed: false
+      - sdk: AVFoundation.framework
+      - sdk: Metal.framework
+      - sdk: ImageIO.framework
+    settings:
+      base:
+        PRODUCT_NAME: screc-check
+        # The tool runs next to ScrecCore.framework in the build folder.
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path @executable_path/../Frameworks"
+
+  ScrecCoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [Tests/ScrecCoreTests]
+    dependencies:
+      - target: ScrecCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.screc.ScrecCoreTests
+
+  ScrecRenderTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [Tests/ScrecRenderTests]
+    dependencies:
+      - target: ScrecRender
+      - target: ScrecCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.screc.ScrecRenderTests
+
+schemes:
+  Screc:
+    build:
+      targets:
+        Screc: all
+        screc-check: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets: [ScrecCoreTests, ScrecRenderTests]

@@ -1,0 +1,363 @@
+// Screc compositor shaders (ARCHITECTURE §9.2).
+// All passes work in linear light. Every value comes from uniforms: no time, no randomness,
+// so the same project at the same timeline time always gives the same pixels.
+
+#include <metal_stdlib>
+using namespace metal;
+
+struct VertexOut {
+    float4 position [[position]];
+    float2 uv;          // 0…1, top-left origin
+};
+
+// One triangle that covers the whole target.
+vertex VertexOut fullscreenVertex(uint vid [[vertex_id]]) {
+    float2 p = float2((vid << 1) & 2, vid & 2);
+    VertexOut o;
+    o.position = float4(p * 2.0 - 1.0, 0.0, 1.0);
+    o.uv = float2(p.x, 1.0 - p.y);
+    return o;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Background
+// ---------------------------------------------------------------------------------------------
+
+struct BackgroundUniforms {
+    float4 info;          // x: kind (0 wallpaper, 1 linear, 2 radial, 3 color, 4 image), y: canvas aspect, z: warp, w: seed
+    float4 points[4];     // wallpaper points (x, y) | gradient stop locations in .x
+    float4 colors[4];     // linear rgb
+    float4 gradient;      // x: stop count, y: angle (radians), z: image aspect
+};
+
+static float hash12(float2 p) {
+    float3 p3 = fract(float3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+static float3 gradientColor(constant BackgroundUniforms &u, float t) {
+    int n = int(u.gradient.x);
+    t = clamp(t, 0.0, 1.0);
+    if (t <= u.points[0].x) return u.colors[0].rgb;
+    for (int i = 0; i < n - 1; i++) {
+        float a = u.points[i].x, b = u.points[i + 1].x;
+        if (t <= b) return mix(u.colors[i].rgb, u.colors[i + 1].rgb, (t - a) / max(b - a, 1e-5));
+    }
+    return u.colors[max(n - 1, 0)].rgb;
+}
+
+fragment float4 backgroundFragment(VertexOut in [[stage_in]],
+                                   constant BackgroundUniforms &u [[buffer(0)]],
+                                   texture2d<float> image [[texture(0)]],
+                                   sampler s [[sampler(0)]]) {
+    float2 uv = in.uv;
+    int kind = int(u.info.x);
+    float aspect = u.info.y;
+    float3 c;
+    if (kind == 0) {
+        // Mesh gradient: inverse-distance blend of four colour points over a gently warped plane.
+        float2 p = float2(uv.x * aspect, uv.y);
+        float warp = u.info.z, seed = u.info.w;
+        p += warp * 0.18 * float2(sin(p.y * 3.1 + seed) + 0.5 * sin(p.y * 7.3 + seed * 2.1),
+                                  cos(p.x * 2.7 + seed * 1.7) + 0.5 * cos(p.x * 6.1 + seed * 0.7));
+        float3 acc = 0; float wsum = 0;
+        for (int i = 0; i < 4; i++) {
+            float2 q = float2(u.points[i].x * aspect, u.points[i].y);
+            float d = distance(p, q);
+            float w = 1.0 / pow(d * d + 0.04, 1.6);
+            acc += u.colors[i].rgb * w;
+            wsum += w;
+        }
+        c = acc / wsum;
+    } else if (kind == 1) {
+        float a = u.gradient.y;
+        float2 dir = float2(cos(a), sin(a));
+        float2 p = float2((uv.x - 0.5) * aspect, uv.y - 0.5);
+        float extent = 0.5 * (abs(dir.x) * aspect + abs(dir.y));
+        c = gradientColor(u, dot(p, dir) / (2.0 * extent) + 0.5);
+    } else if (kind == 2) {
+        float2 p = float2((uv.x - 0.5) * aspect, uv.y - 0.5);
+        c = gradientColor(u, length(p) / (0.5 * sqrt(aspect * aspect + 1.0)));
+    } else if (kind == 3) {
+        c = u.colors[0].rgb;
+    } else {
+        // Image, aspect-fill.
+        float ia = max(u.gradient.z, 1e-3);
+        float2 t = uv - 0.5;
+        if (aspect > ia) t.y *= ia / aspect; else t.x *= aspect / ia;
+        c = image.sample(s, t + 0.5).rgb;
+    }
+    // Tiny ordered noise against banding in smooth gradients (deterministic: depends on the pixel only).
+    c += (hash12(in.position.xy) - 0.5) / 255.0;
+    return float4(c, 1.0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scene: background + shadow + screen + click effects + cursor
+// ---------------------------------------------------------------------------------------------
+
+struct SceneUniforms {
+    float4 sceneSize;     // xy: pixels
+    float4 screenRect;    // x, y, w, h in scene pixels
+    float4 crop;          // normalised recording rect x, y, w, h
+    float4 corner;        // x: radius px, y: inset width px, z: inset on, w: has frame
+    float4 shadow;        // x, y: offset px, z: sigma px, w: opacity
+    float4 cursorSprite;  // x, y: sprite size px, z, w: hotspot px
+    float4 cursorInfo;    // x: opacity, y: tap count, z: show cursor, w: unused
+    float4 clickInfo;     // x: click count, y: radius scale px, z: style (1 circle, 2 ripple)
+    float4 maskInfo;      // x: mask count, y: any highlight active
+};
+
+static float sdRoundRect(float2 p, float2 halfSize, float r) {
+    float2 q = abs(p) - halfSize + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+static float3 srgbToLinear(float3 c) {
+    return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
+}
+
+// Video-range BT.709 Y'CbCr → R'G'B' → linear.
+static float3 yuvToLinear(float y, float2 cbcr) {
+    float Y = (y - 16.0 / 255.0) * (255.0 / 219.0);
+    float Cb = (cbcr.x - 128.0 / 255.0) * (255.0 / 224.0);
+    float Cr = (cbcr.y - 128.0 / 255.0) * (255.0 / 224.0);
+    float3 rgb = float3(Y + 1.5748 * Cr, Y - 0.1873 * Cb - 0.4681 * Cr, Y + 1.8556 * Cb);
+    return srgbToLinear(clamp(rgb, 0.0, 1.0));
+}
+
+fragment float4 sceneFragment(VertexOut in [[stage_in]],
+                              constant SceneUniforms &u [[buffer(0)]],
+                              constant float4 *cursorTaps [[buffer(1)]],    // x, y (px), angle (rad), unused
+                              constant float4 *clicks [[buffer(2)]],        // x, y (px), age 0…1, unused
+                              constant float4 *masks [[buffer(3)]],         // pairs: rect (normalised recording), info (kind, strength)
+                              texture2d<float> background [[texture(0)]],
+                              texture2d<float> lumaTex [[texture(1)]],
+                              texture2d<float> chromaTex [[texture(2)]],
+                              texture2d<float> cursorTex [[texture(3)]],
+                              texture2d<float> blurredTex [[texture(4)]],
+                              sampler s [[sampler(0)]]) {
+    float2 px = in.uv * u.sceneSize.xy;
+    float3 color = background.sample(s, in.uv).rgb;
+
+    float2 center = u.screenRect.xy + u.screenRect.zw * 0.5;
+    float2 halfSize = u.screenRect.zw * 0.5;
+    float radius = min(u.corner.x, min(halfSize.x, halfSize.y));
+
+    // Shadow: Gaussian-blurred rounded rectangle, approximated with a smooth falloff of the distance.
+    if (u.shadow.w > 0.0) {
+        float d = sdRoundRect(px - center - u.shadow.xy, halfSize, radius);
+        float sigma = max(u.shadow.z, 0.5);
+        float a = 1.0 - smoothstep(-sigma, 2.5 * sigma, d);
+        color = mix(color, float3(0.0), a * u.shadow.w);
+    }
+
+    // Screen with rounded corners (1 px anti-aliased edge).
+    float d = sdRoundRect(px - center, halfSize, radius);
+    float coverage = clamp(0.5 - d, 0.0, 1.0);
+    if (coverage > 0.0) {
+        float3 screen = float3(0.0);
+        if (u.corner.w > 0.5) {
+            float2 local = (px - u.screenRect.xy) / u.screenRect.zw;
+            float2 src = u.crop.xy + clamp(local, 0.0, 1.0) * u.crop.zw;
+            // Shrinking the recording: average n×n samples spread over the recording pixels this scene pixel
+            // covers. One bilinear sample per pixel skips pixels and breaks up thin text.
+            float2 step = u.crop.zw / u.screenRect.zw;                          // recording uv per scene pixel
+            float2 texels = step * float2(lumaTex.get_width(), lumaTex.get_height());
+            int n = clamp(int(ceil(max(texels.x, texels.y) - 0.01)), 1, 4);
+            if (n == 1) {
+                screen = yuvToLinear(lumaTex.sample(s, src).r, chromaTex.sample(s, src).rg);
+            } else {
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j < n; j++) {
+                        float2 o = (float2(i, j) + 0.5) / float(n) - 0.5;
+                        float2 p = clamp(src + o * step, u.crop.xy, u.crop.xy + u.crop.zw);
+                        screen += yuvToLinear(lumaTex.sample(s, p).r, chromaTex.sample(s, p).rg);
+                    }
+                }
+                screen /= float(n * n);
+            }
+
+            // Masks (rectangles in recording coordinates, so they stay on the content when zoomed).
+            int maskCount = int(u.maskInfo.x);
+            bool inHighlight = false;
+            float dim = 0.0;
+            for (int i = 0; i < maskCount; i++) {
+                float4 r = masks[2 * i];
+                float4 info = masks[2 * i + 1];
+                // Soft 1 px edge in scene pixels.
+                float2 lo = (src - r.xy) * u.screenRect.zw / u.crop.zw;
+                float2 hi = (r.xy + r.zw - src) * u.screenRect.zw / u.crop.zw;
+                float inside = clamp(min(min(lo.x, lo.y), min(hi.x, hi.y)) + 0.5, 0.0, 1.0);
+                int kind = int(info.x);
+                if (kind == 0) {
+                    screen = mix(screen, blurredTex.sample(s, src).rgb, inside);
+                } else if (kind == 1) {
+                    screen = mix(screen, float3(0.035), inside);
+                } else {
+                    if (inside > 0.5) inHighlight = true;
+                    dim = max(dim, info.y);
+                }
+            }
+            if (u.maskInfo.y > 0.5 && !inHighlight) screen *= (1.0 - 0.8 * dim);
+        }
+        if (u.corner.z > 0.5) {
+            // Inset: thin light border just inside the edge.
+            float w = max(u.corner.y, 0.75);
+            float border = clamp(0.5 - abs(d + w * 0.5) + w * 0.5, 0.0, 1.0);
+            screen = mix(screen, float3(1.0), border * 0.28);
+        }
+        color = mix(color, screen, coverage);
+    }
+
+    // Click effects, under the cursor.
+    int clickCount = int(u.clickInfo.x);
+    for (int i = 0; i < clickCount; i++) {
+        float2 c = clicks[i].xy;
+        float age = clicks[i].z;              // 0…1 over the effect's life
+        float r0 = u.clickInfo.y;
+        float dist = distance(px, c);
+        float ease = 1.0 - pow(1.0 - age, 3.0);
+        if (u.clickInfo.z < 1.5) {
+            // Circle: a soft disc that grows and fades.
+            float r = r0 * (0.6 + 0.9 * ease);
+            float a = (1.0 - smoothstep(r - 1.5, r + 1.5, dist)) * 0.32 * (1.0 - age);
+            color = mix(color, float3(1.0), a);
+        } else {
+            // Ripple: two thin rings that expand and fade.
+            for (int k = 0; k < 2; k++) {
+                float e = clamp(ease - 0.18 * float(k), 0.0, 1.0);
+                float r = r0 * (0.4 + 1.6 * e);
+                float ring = 1.0 - smoothstep(0.0, max(1.5, r0 * 0.12), abs(dist - r));
+                color = mix(color, float3(1.0), ring * 0.55 * (1.0 - age) * (k == 0 ? 1.0 : 0.6));
+            }
+        }
+    }
+
+    // Cursor, averaged over its motion-blur taps.
+    if (u.cursorInfo.z > 0.5 && u.cursorInfo.x > 0.0) {
+        int taps = max(int(u.cursorInfo.y), 1);
+        float4 acc = 0.0;
+        for (int i = 0; i < taps; i++) {
+            float2 rel = px - cursorTaps[i].xy;
+            float ang = -cursorTaps[i].z;
+            float2 rot = float2(rel.x * cos(ang) - rel.y * sin(ang), rel.x * sin(ang) + rel.y * cos(ang));
+            float2 st = (rot + u.cursorSprite.zw) / u.cursorSprite.xy;
+            if (all(st >= 0.0) && all(st <= 1.0)) acc += cursorTex.sample(s, st);   // premultiplied
+        }
+        acc /= float(taps);
+        acc *= u.cursorInfo.x;
+        color = color * (1.0 - acc.a) + acc.rgb;
+    }
+    return float4(color, 1.0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Camera: zoom transform of the whole composition, with motion-blur taps
+// ---------------------------------------------------------------------------------------------
+
+struct CameraUniforms {
+    float4 info;          // x: tap count, y: scene pixels per output pixel at scale 1, zw: output size
+};
+
+fragment float4 cameraFragment(VertexOut in [[stage_in]],
+                               constant CameraUniforms &u [[buffer(0)]],
+                               constant float4 *taps [[buffer(1)]],           // scale, center x, center y, unused
+                               texture2d<float> scene [[texture(0)]],
+                               sampler s [[sampler(0)]]) {
+    int n = max(int(u.info.x), 1);
+    float4 acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        float z = taps[i].x;
+        float2 c = taps[i].yz;
+        float2 uv = c + (in.uv - 0.5) / z;
+        // The scene is made sharper than the output while zooming; when it is shrunk (zooming out), average
+        // the scene pixels behind this output pixel.
+        int m = clamp(int(ceil(u.info.y / z - 0.01)), 1, 3);
+        if (m == 1) {
+            acc += scene.sample(s, uv);
+        } else {
+            float2 step = 1.0 / (u.info.zw * z);                       // scene uv per output pixel
+            float4 sum = 0.0;
+            for (int a = 0; a < m; a++) {
+                for (int b = 0; b < m; b++) {
+                    sum += scene.sample(s, uv + ((float2(a, b) + 0.5) / float(m) - 0.5) * step);
+                }
+            }
+            acc += sum / float(m * m);
+        }
+    }
+    return float4((acc / float(n)).rgb, 1.0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Source → linear RGB (input for the blur masks)
+// ---------------------------------------------------------------------------------------------
+
+fragment float4 sourceRGBFragment(VertexOut in [[stage_in]],
+                                  texture2d<float> lumaTex [[texture(0)]],
+                                  texture2d<float> chromaTex [[texture(1)]],
+                                  sampler s [[sampler(0)]]) {
+    return float4(yuvToLinear(lumaTex.sample(s, in.uv).r, chromaTex.sample(s, in.uv).rg), 1.0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Overlays drawn on top of the camera pass (not zoomed): keyboard-shortcut badge
+// ---------------------------------------------------------------------------------------------
+
+struct WebcamUniforms {
+    float4 rect;          // x, y, w, h in target pixels
+    float4 info;          // x: opacity, y: corner radius (px), z: mirror, w: shadow
+    float4 sizes;         // x, y: target size; z, w: camera picture size
+};
+
+float roundedBoxDistance(float2 p, float2 center, float2 halfSize, float r) {
+    float2 q = abs(p - center) - (halfSize - r);
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+/// The webcam picture filling a rounded rectangle (cropped to fill, optionally mirrored), with a soft shadow.
+fragment float4 webcamFragment(VertexOut in [[stage_in]],
+                               constant WebcamUniforms &u [[buffer(0)]],
+                               texture2d<float> cam [[texture(0)]],
+                               sampler s [[sampler(0)]]) {
+    float2 px = in.uv * u.sizes.xy;
+    float2 halfSize = u.rect.zw * 0.5;
+    float2 center = u.rect.xy + halfSize;
+    float r = min(u.info.y, min(halfSize.x, halfSize.y));
+    float d = roundedBoxDistance(px, center, halfSize, r);
+    float inside = clamp(0.5 - d, 0.0, 1.0);
+    float4 color = float4(0.0);
+    if (inside > 0.0) {
+        float2 st = (px - u.rect.xy) / u.rect.zw;
+        float boxAspect = u.rect.z / max(u.rect.w, 1.0), camAspect = u.sizes.z / max(u.sizes.w, 1.0);
+        float2 uv = st;
+        if (camAspect > boxAspect) { uv.x = 0.5 + (st.x - 0.5) * boxAspect / camAspect; }
+        else { uv.y = 0.5 + (st.y - 0.5) * camAspect / boxAspect; }
+        if (u.info.z > 0.5) { uv.x = 1.0 - uv.x; }
+        color = float4(cam.sample(s, uv).rgb, 1.0) * inside;
+    }
+    if (u.info.w > 0.5 && inside < 1.0) {
+        float blur = max(min(halfSize.x, halfSize.y) * 0.3, 3.0);
+        float ds = roundedBoxDistance(px - float2(0.0, blur * 0.25), center, halfSize, r);
+        float shadow = 0.4 * (1.0 - smoothstep(-blur * 0.3, blur, ds));
+        color = color + float4(0.0, 0.0, 0.0, shadow) * (1.0 - color.a);
+    }
+    return color * u.info.x;          // premultiplied
+}
+
+struct OverlayUniforms {
+    float4 rect;          // x, y, w, h in target pixels
+    float4 info;          // x: opacity, y, z: target size
+};
+
+fragment float4 overlayFragment(VertexOut in [[stage_in]],
+                                constant OverlayUniforms &u [[buffer(0)]],
+                                texture2d<float> image [[texture(0)]],
+                                sampler s [[sampler(0)]]) {
+    float2 px = in.uv * u.info.yz;
+    float2 st = (px - u.rect.xy) / u.rect.zw;
+    if (any(st < 0.0) || any(st > 1.0)) return float4(0.0);
+    return image.sample(s, st) * u.info.x;     // premultiplied
+}
