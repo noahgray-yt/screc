@@ -1,11 +1,25 @@
 # Screc
 
+<img width="1168" height="720" alt="sample recording" src="https://github.com/user-attachments/assets/81809af2-4c64-4ad3-bd0f-b8537b346597" />
+
+
 Screc is a personal, local-only screen recorder and editor for macOS. It records the screen, camera,
 microphone and system audio together with every click and key press, then turns the take into a polished
 video: automatic zooms that follow the cursor, a smooth cursor, backgrounds, camera layouts, captions,
 transcript editing, music and export to MP4 or GIF. Everything stays on your Mac.
 
 Requires macOS 15 or newer (captions need macOS 26).
+
+## Screenshots
+
+<img width="100%" alt="camera overlay" src="https://github.com/user-attachments/assets/a4dda36d-fb71-4474-84cc-d8229594b28e" />
+
+<p>
+  <img width="300" alt="settings recorder" src="https://github.com/user-attachments/assets/128c0087-8eaf-416f-9c01-b14c46135e2b" />
+  <img width="300" alt="audio settings" src="https://github.com/user-attachments/assets/4a3f19d1-dbcb-462a-b11f-cd7cf77af8a7" />
+</p>
+
+<img width="100%" alt="timeline editor" src="https://github.com/user-attachments/assets/03d31128-0ac5-4204-b26b-4fe3337d6e74" />
 
 ## Build
 
